@@ -4,9 +4,6 @@
 #![feature(impl_trait_in_assoc_type)]
 
 extern crate alloc;
-mod microphone;
-mod class_codes;
-mod terminal_type;
 
 use core::cmp::PartialEq;
 use core::future::Future;
@@ -28,11 +25,10 @@ use embedded_alloc::LlffHeap as Heap;
 use static_cell::StaticCell;
 
 
-use embassy_net::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
+use embassy_net::{IpEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4, IpAddress, IpListenEndpoint};
 use embassy_executor::{Executor, Spawner};
-use embassy_futures::select::{select, Either, Select};
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_net::udp::{PacketMetadata, RecvError, UdpMetadata, UdpSocket};
+use embassy_net::udp::{PacketMetadata, UdpMetadata, UdpSocket};
 use embassy_rp::{gpio, pwm, spi, peripherals, i2c, pio, uart, pac, usb, dma, bind_interrupts};
 use embassy_rp::gpio::{Output, Pin};
 use embassy_rp::peripherals::USB;
@@ -113,81 +109,12 @@ fn main() -> ! {
 }
 
 
-type MyUsbDriver = Driver<'static, USB>;
-type MyUsbDevice = UsbDevice<'static, MyUsbDriver>;
-
-#[embassy_executor::task]
-async fn usb_task(mut usb: MyUsbDevice) -> ! {
-    usb.run().await
-}
 
 const WIFI_NETWORK: &str = "PicoAudioLink0";
 const WIFI_PASSWORD: &str = "W86i<u9vL=S|";
 
 #[embassy_executor::task]
 async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
-
-    // usb stack init
-    let driver = embassy_rp::usb::Driver::new(p.USB, Irqs);
-
-    let config = {
-        let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
-        config.manufacturer = Some("Christian");
-        config.product = Some("USB-example");
-        config.serial_number = Some("12345678");
-        config.max_power = 100;
-        config.max_packet_size_0 = 64;
-        config
-    };
-
-    // Create embassy-usb DeviceBuilder using the driver and config.
-    // It needs some buffers for building the descriptors.
-    let mut builder = {
-        static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-        static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-        static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-
-        let builder = embassy_usb::Builder::new(
-            driver,
-            config,
-            CONFIG_DESCRIPTOR.init([0; 256]),
-            BOS_DESCRIPTOR.init([0; 256]),
-            &mut [], // no msos descriptors
-            CONTROL_BUF.init([0; 64]),
-        );
-        builder
-    };
-
-    let (mut usb_audio_stream, usb_audio_control) = {
-        static STATE: StaticCell<microphone::State> = StaticCell::new();
-        let state = STATE.init(microphone::State::new());
-        microphone::Microphone::new(
-            &mut builder,
-            state,
-            64,
-            SampleWidth::Width2Byte,
-            &[48000],
-            &[microphone::Channel::OnlyChannel],
-        )
-    };
-
-    let (a, b, c) = {
-        static STATE: StaticCell<speaker::State> = StaticCell::new();
-        let state = STATE.init(speaker::State::new());
-        speaker::Speaker::new(
-            &mut builder,
-            state,
-            64,
-            SampleWidth::Width2Byte,
-            &[48000],
-            &[uac1::Channel::LeftFront],
-            FeedbackRefresh::Period32Frames
-        )
-    };
-
-    let usb = builder.build();
-
-    unwrap!(spawner.spawn(usb_task(usb)));
 
     let mut delay = Delay;
     let mut delay2 = Delay;
@@ -222,12 +149,15 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
+    let addr_device = IpAddress::v4(192, 168, 0, 1);
+    let addr_dongle = IpAddress::v4(192, 168, 0, 0);
 
     let config = embassy_net::Config::ipv4_static(StaticConfigV4{
-        address: Ipv4Cidr::from_str("192.168.0.0/24").unwrap(),
+        address: Ipv4Cidr::from_str("192.168.0.1/24").unwrap(),
         gateway: None,
         dns_servers: Vec::new()
     });
+
 
     // Generate random seed
     let seed = 0x0123_4567_89ab_cdef; // chosen by fair dice roll. guaranteed to be random.
@@ -243,16 +173,38 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
 
     unwrap!(spawner.spawn(net_task(runner)));
 
-       control
-            .start_ap_wpa2(WIFI_NETWORK, WIFI_PASSWORD, 3)
-            .await;
+    loop {
+        match control
+            .join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+            .await
+        {
+            Ok(_) => break,
+            Err(err) => {
+                info!("join failed with status={}", err.status);
+            }
+        }
+    }
 
     // Wait for DHCP, not necessary when using static IP
-    info!("waiting for Network...");
+    info!("waiting for DHCP...");
     while !stack.is_config_up() {
         Timer::after_millis(100).await;
     }
-    info!("Network is now up!");
+    info!("DHCP is now up!");
+
+    defmt::trace!("Hello World!");
+
+    let mut scl1 = p.PIN_19;
+    let mut sda1 = p.PIN_18;
+
+    Timer::after_millis(100).await;
+
+    defmt::trace!("Checkpoint 3");
+
+
+    defmt::trace!("Checkpoint 8");
+    Timer::after_millis(100).await;
+
 
     let mut rx_meta = [PacketMetadata::EMPTY; 24];
     let mut rx_buff = [0u8; 2048];
@@ -264,49 +216,30 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
                                     &mut tx_meta,
                                     &mut tx_buff
     );
-    let our_endpoint = IpListenEndpoint{ addr: Some(IpAddress::v4(192, 168, 0, 0)), port:1000 };
+    let our_endpoint = IpListenEndpoint{ addr: Some(addr_device.clone()), port:1000 };
     udp_socket.bind(our_endpoint).unwrap();
 
 
-    let mut recv_buf = [0u8; 10240];
-    let mut good_samples = 0usize;
-    let mut latest_buffer = [0u8; 10240];
-    let mut last_buffer_start = Instant::now();
-    const SAMPLES_PER_PACKET: u32 = 32;
+    let remote_endpoint = UdpMetadata::from( IpEndpoint::new( addr_dongle, 1000 ));
+    const SAMPLES_PER_PACKET: u32 = 500;
     let sample_rate = 48000u64;
     let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
     let sample_interval_ns = (1000_000_000) / sample_rate;
-    let mut last_packet_instant = Instant::now();
+    let mut last_packet_instant = None;
     loop {
-        let a = Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns));
-        let b = udp_socket.recv_from(&mut recv_buf);
-        match select(a, b).await {
-            Either::First(x) => {
-                let current_time = Instant::now();
-                last_packet_instant = current_time;
-                let offset = (((current_time - last_buffer_start).as_millis()*1000)/sample_interval_ns) as usize;
-                let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
-                for i in 0..SAMPLES_PER_PACKET as usize {
-                    if (i + offset) < good_samples {
-                        samples_raw[i*2] = latest_buffer[(offset + i)*2] ;
-                        samples_raw[i*2 + 1] = latest_buffer[(offset + i)*2+1];
-                    }
-                }
-                usb_audio_stream.write_packet(&samples_raw).await.unwrap();
-            }
-            Either::Second(x) => {
-                match x {
-                    Ok((a, b)) => {
-                        defmt::info!("Received a packet: {:?}", a);
-                        latest_buffer[0..a].copy_from_slice(&recv_buf[0..a]);
-                        good_samples = a/2;
-                        last_buffer_start = Instant::now()
-                    }
-                    Err(x) => {
-                        defmt::error!("Received an error: {:?}", x);
-                    }
-                }
-            }
+        if let Some(last_packet_instant) = last_packet_instant {
+            Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns)).await;
         }
+        let current_time = Instant::now();
+        last_packet_instant = Some(current_time);
+        let current_timestamp_ns = current_time.as_micros()*1000;
+        let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
+        for i in 0..SAMPLES_PER_PACKET as usize {
+            let current_timestamp_ns = current_timestamp_ns + (i as u64*sample_interval_ns);
+            let sample = if current_timestamp_ns%500_000 < 200_000 {20000u16} else {0u16};
+            samples_raw[i*2] = ((sample)&0xFF) as u8;
+            samples_raw[i*2 + 1] = ((sample>>8)&0xFF) as u8;
+        }
+        udp_socket.send_to(&samples_raw[..], remote_endpoint.clone()).await.unwrap();
     }
 }

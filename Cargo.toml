@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/audio-link-proto", "crates/audio-link-dongle"]
+members = ["crates/audio-link-proto", "crates/audio-link-dongle", "crates/audio-link-device"]
 
 
 [patch.crates-io]
@@ -11,6 +11,8 @@ embassy-executor =       {git = "https://github.com/embassy-rs/embassy.git", rev
 embassy-executor-macros =       {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}
 embassy-futures =        {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}
 embassy-hal-internal =  {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}
+embassy-usb =           {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}
+embassy-usb-driver =           {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}
 embassy-net =           {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}
 embassy-net-driver =           {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}
 embassy-net-driver-channel =           {git = "https://github.com/embassy-rs/embassy.git", rev="ef673c6ca310cf0a7e9b1254afb7806bd6879e94"}

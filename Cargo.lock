@@ -520,7 +520,7 @@ dependencies = [
  "embassy-time",
  "embassy-time-driver",
  "embassy-time-queue-utils",
- "embassy-usb-driver 0.2.0 (git+https://github.com/embassy-rs/embassy.git?rev=ef673c6ca310cf0a7e9b1254afb7806bd6879e94)",
+ "embassy-usb-driver",
  "embedded-hal 0.2.7",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
@@ -590,28 +590,17 @@ dependencies = [
 [[package]]
 name = "embassy-usb"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb69c7ca7fa90b9ae590e3dea985ef80df06d900a350f9cc9d3f3c8113fc4370"
+source = "git+https://github.com/embassy-rs/embassy.git?rev=ef673c6ca310cf0a7e9b1254afb7806bd6879e94#ef673c6ca310cf0a7e9b1254afb7806bd6879e94"
 dependencies = [
  "defmt 1.0.1",
  "embassy-futures",
  "embassy-net-driver-channel",
  "embassy-sync",
- "embassy-usb-driver 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "embassy-usb-driver",
  "embedded-io-async",
  "heapless",
  "ssmarshal",
  "usbd-hid",
-]
-
-[[package]]
-name = "embassy-usb-driver"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17119855ccc2d1f7470a39756b12068454ae27a3eabb037d940b5c03d9c77b7a"
-dependencies = [
- "defmt 1.0.1",
- "embedded-io-async",
 ]
 
 [[package]]
@@ -1187,6 +1176,46 @@ name = "pico-args"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
+
+[[package]]
+name = "pico-audio-device"
+version = "0.1.0"
+dependencies = [
+ "bumpalo",
+ "cortex-m",
+ "cortex-m-rt",
+ "cyw43",
+ "cyw43-pio",
+ "defmt 0.3.100",
+ "defmt-rtt",
+ "embassy-embedded-hal",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-rp",
+ "embassy-sync",
+ "embassy-time",
+ "embassy-usb",
+ "embassy-usb-logger",
+ "embedded-alloc",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-hal-bus",
+ "embedded-hal-nb",
+ "embedded-io-async",
+ "embedded-nal-async",
+ "fixed",
+ "heapless",
+ "log",
+ "micromath",
+ "nb 1.1.0",
+ "panic-probe",
+ "paste",
+ "portable-atomic",
+ "static_cell",
+ "uom",
+ "usbd-hid",
+]
 
 [[package]]
 name = "pico-audio-link"
