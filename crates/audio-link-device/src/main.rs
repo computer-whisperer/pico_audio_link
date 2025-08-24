@@ -27,12 +27,16 @@ use static_cell::StaticCell;
 
 use embassy_net::{IpEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4, IpAddress, IpListenEndpoint};
 use embassy_executor::{Executor, Spawner};
+use embassy_futures::join::join3;
+use embassy_futures::select::{select, Either, Select};
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_net::udp::{PacketMetadata, UdpMetadata, UdpSocket};
+use embassy_net::udp::{PacketMetadata, RecvError, SendError, UdpMetadata, UdpSocket};
 use embassy_rp::{gpio, pwm, spi, peripherals, i2c, pio, uart, pac, usb, dma, bind_interrupts};
+use embassy_rp::adc::Sample;
 use embassy_rp::gpio::{Output, Pin};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
+use embassy_sync::signal::Signal;
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::{speaker, FeedbackRefresh, SampleWidth};
 use embassy_usb::class::uac1::speaker::Speaker;
@@ -219,27 +223,111 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
     let our_endpoint = IpListenEndpoint{ addr: Some(addr_device.clone()), port:1000 };
     udp_socket.bind(our_endpoint).unwrap();
 
+    const TRANSFER_PACKET_SIZE: usize = 1024;
+    const SAMPLE_LEN_BYTES: usize = 2;
 
     let remote_endpoint = UdpMetadata::from( IpEndpoint::new( addr_dongle, 1000 ));
-    const SAMPLES_PER_PACKET: u32 = 512;
-    let sample_rate = 48000u64;
-    let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
-    let sample_interval_ns = (1000_000_000) / sample_rate;
-    let mut last_packet_instant = None;
-    loop {
-        if let Some(last_packet_instant) = last_packet_instant {
-            Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns)).await;
+    let mic_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize)> = Signal::new();
+    let speaker_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize, Instant)> = Signal::new();
+
+    let udp_task = async {
+        let mut recv_buf = [0u8; 1024];
+        loop {
+            let a = mic_data_signal.wait();
+            let b = udp_socket.recv_from(&mut recv_buf);
+            match select(a, b).await {
+                Either::First((a, b)) => {
+                    match udp_socket.send_to(
+                        &a[0..b*SAMPLE_LEN_BYTES],
+                        remote_endpoint.clone()
+                    ).await {
+                        Err(e) => {
+                            defmt::error!("udp send error: {:?}", e)
+                        }
+                        _ => {}
+                    }
+                }
+                Either::Second(a) => {
+                    match a {
+                        Ok((a, b )) => {
+                            speaker_data_signal.signal((
+                                recv_buf.clone(),
+                                a,
+                                Instant::now()
+                                ));
+                        }
+                        Err(e) => {
+                            defmt::error!("udp recv error: {:?}", e)
+                        }
+                    }
+                }
+            }
         }
-        let current_time = Instant::now();
-        last_packet_instant = Some(current_time);
-        let current_timestamp_ns = current_time.as_micros()*1000;
-        let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
-        for i in 0..SAMPLES_PER_PACKET as usize {
-            let current_timestamp_ns = current_timestamp_ns + (i as u64*sample_interval_ns);
-            let sample = if current_timestamp_ns%500_000 < 200_000 {20000u16} else {0u16};
-            samples_raw[i*2] = ((sample)&0xFF) as u8;
-            samples_raw[i*2 + 1] = ((sample>>8)&0xFF) as u8;
+    };
+    
+    let spkr_task = async{
+        const SAMPLES_PER_PACKET: u32 = 32;
+        let mut latest_buffer = [0u8; TRANSFER_PACKET_SIZE];
+        let sample_rate = 48000u64;
+        let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
+        let sample_interval_ns = (1000_000_000) / sample_rate;
+        let mut last_buffer_start = Instant::now();
+        let mut good_samples = 0usize;
+
+        let mut last_packet_instant = Instant::now();
+        loop {
+            let a = Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns));
+            let b = speaker_data_signal.wait();
+            match select(a, b).await {
+                Either::First(_) => {
+                    let current_time = Instant::now();
+                    last_packet_instant = current_time;
+                    let offset = (((current_time - last_buffer_start).as_millis()*1000)/sample_interval_ns) as usize;
+                    let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
+                    for i in 0..SAMPLES_PER_PACKET as usize {
+                        if (i + offset) < good_samples {
+                            for j in 0..SAMPLE_LEN_BYTES {
+                                samples_raw[i*SAMPLE_LEN_BYTES + j] =
+                                    latest_buffer[(i + offset)*SAMPLE_LEN_BYTES + j]
+                            }
+                        }
+                    }
+                    // Actually write samples
+                },
+                Either::Second((a, b, c)) => {
+                    latest_buffer.copy_from_slice(&a);
+                    good_samples = b;
+                    last_buffer_start = c;
+                }
+            }
         }
-        udp_socket.send_to(&samples_raw[..], remote_endpoint.clone()).await.unwrap();
-    }
+    };
+    
+    let mic_task = async{
+        const SAMPLES_PER_PACKET: u32 = 512;
+        let sample_rate = 48000u64;
+        let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
+        let sample_interval_ns = (1000_000_000) / sample_rate;
+        let mut last_packet_instant = None;
+        loop {
+            if let Some(last_packet_instant) = last_packet_instant {
+                Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns)).await;
+            }
+            let current_time = Instant::now();
+            last_packet_instant = Some(current_time);
+            let current_timestamp_ns = current_time.as_micros()*1000;
+            let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*SAMPLE_LEN_BYTES];
+            for i in 0..SAMPLES_PER_PACKET as usize {
+                let current_timestamp_ns = current_timestamp_ns + (i as u64*sample_interval_ns);
+                let sample = if current_timestamp_ns%500_000 < 200_000 {20000u32} else {0u32};
+                for j in 0..SAMPLE_LEN_BYTES {
+                    samples_raw[i*SAMPLE_LEN_BYTES + j] = ((sample >> (8*j))&0xFF) as u8;
+                }
+            }
+            mic_data_signal.signal((samples_raw, SAMPLES_PER_PACKET as usize));
+        }
+    };
+    
+    join3(udp_task, spkr_task, mic_task).await;
+    
 }
