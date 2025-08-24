@@ -30,16 +30,19 @@ use static_cell::StaticCell;
 
 use embassy_net::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embassy_executor::{Executor, Spawner};
-use embassy_futures::select::{select, Either, Select};
+use embassy_futures::join::join3;
+use embassy_futures::select::{select, select3, Either, Either3, Select};
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::udp::{PacketMetadata, RecvError, UdpMetadata, UdpSocket};
 use embassy_rp::{gpio, pwm, spi, peripherals, i2c, pio, uart, pac, usb, dma, bind_interrupts};
 use embassy_rp::gpio::{Output, Pin};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
+use embassy_sync::signal::Signal;
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::{speaker, FeedbackRefresh, SampleWidth};
 use embassy_usb::class::uac1::speaker::Speaker;
+use embassy_usb::driver::EndpointError;
 use embassy_usb::UsbDevice;
 use fixed::FixedU32;
 use heapless::Vec;
@@ -171,7 +174,7 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
         )
     };
 
-    let (a, b, c) = {
+    let (mut speaker_stream, b, c) = {
         static STATE: StaticCell<speaker::State> = StaticCell::new();
         let state = STATE.init(speaker::State::new());
         speaker::Speaker::new(
@@ -223,6 +226,9 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
+
+    let addr_device = IpAddress::v4(192, 168, 0, 1);
+    let addr_dongle = IpAddress::v4(192, 168, 0, 0);
     let config = embassy_net::Config::ipv4_static(StaticConfigV4{
         address: Ipv4Cidr::from_str("192.168.0.0/24").unwrap(),
         gateway: None,
@@ -264,49 +270,105 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
                                     &mut tx_meta,
                                     &mut tx_buff
     );
-    let our_endpoint = IpListenEndpoint{ addr: Some(IpAddress::v4(192, 168, 0, 0)), port:1000 };
+    let our_endpoint = IpListenEndpoint{ addr: Some(addr_dongle), port:1000 };
+    let remote_endpoint = UdpMetadata::from( IpEndpoint::new( addr_device, 1000 ));
     udp_socket.bind(our_endpoint).unwrap();
 
+    const TRANSFER_PACKET_SIZE: usize = 1024;
+    const SAMPLE_LEN_BYTES: usize = 2;
 
-    let mut recv_buf = [0u8; 10240];
-    let mut good_samples = 0usize;
-    let mut latest_buffer = [0u8; 10240];
-    let mut last_buffer_start = Instant::now();
-    const SAMPLES_PER_PACKET: u32 = 32;
-    let sample_rate = 48000u64;
-    let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
-    let sample_interval_ns = (1000_000_000) / sample_rate;
-    let mut last_packet_instant = Instant::now();
-    loop {
-        let a = Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns));
-        let b = udp_socket.recv_from(&mut recv_buf);
-        match select(a, b).await {
-            Either::First(x) => {
-                let current_time = Instant::now();
-                last_packet_instant = current_time;
-                let offset = (((current_time - last_buffer_start).as_millis()*1000)/sample_interval_ns) as usize;
-                let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
-                for i in 0..SAMPLES_PER_PACKET as usize {
-                    if (i + offset) < good_samples {
-                        samples_raw[i*2] = latest_buffer[(offset + i)*2] ;
-                        samples_raw[i*2 + 1] = latest_buffer[(offset + i)*2+1];
+    let mic_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize, Instant)> = Signal::new();
+    let speaker_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize)> = Signal::new();
+
+    let mic_async = async {
+        const SAMPLES_PER_PACKET: u32 = 32;
+        let mut latest_buffer = [0u8; TRANSFER_PACKET_SIZE];
+        let sample_rate = 48000u64;
+        let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
+        let sample_interval_ns = (1000_000_000) / sample_rate;
+        let mut last_buffer_start = Instant::now();
+        let mut good_samples = 0usize;
+
+        let mut last_packet_instant = Instant::now();
+        loop {
+            let a = Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns));
+            let b = mic_data_signal.wait();
+            match select(a, b).await {
+                Either::First(_) => {
+                    let current_time = Instant::now();
+                    last_packet_instant = current_time;
+                    let offset = (((current_time - last_buffer_start).as_millis()*1000)/sample_interval_ns) as usize;
+                    let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
+                    for i in 0..SAMPLES_PER_PACKET as usize {
+                        if (i + offset) < good_samples {
+                            for j in 0..SAMPLE_LEN_BYTES {
+                                samples_raw[i*SAMPLE_LEN_BYTES + j] =
+                                    latest_buffer[(i + offset)*SAMPLE_LEN_BYTES + j]
+                            }
+                        }
                     }
+                    usb_audio_stream.write_packet(&samples_raw).await.unwrap();
+                },
+                Either::Second((a, b, c)) => {
+                    latest_buffer.copy_from_slice(&a);
+                    good_samples = b;
+                    last_buffer_start = c;
                 }
-                usb_audio_stream.write_packet(&samples_raw).await.unwrap();
             }
-            Either::Second(x) => {
-                match x {
-                    Ok((a, b)) => {
-                        defmt::info!("Received a packet: {:?}", a);
-                        latest_buffer[0..a].copy_from_slice(&recv_buf[0..a]);
-                        good_samples = a/2;
-                        last_buffer_start = Instant::now()
+        }
+    };
+
+    let spkr_async = async {
+        let mut sample_buffer = [0u8; TRANSFER_PACKET_SIZE];
+        let mut sample_buffer_idx = 0;
+        let mut data = [0u8; 64];
+        loop {
+            match speaker_stream.read_packet(&mut data).await {
+                Ok(a) => {
+                    let end = sample_buffer_idx + a;
+                    if end > sample_buffer.len() {
+                        speaker_data_signal.signal((
+                            sample_buffer.clone(),
+                            sample_buffer_idx
+                            ));
+                        sample_buffer_idx = 0;
                     }
-                    Err(x) => {
-                        defmt::error!("Received an error: {:?}", x);
+                    sample_buffer[sample_buffer_idx..sample_buffer_idx+a].copy_from_slice(&data[sample_buffer_idx..sample_buffer_idx+a]);
+                }
+                Err(err) => {
+                   defmt::error!("usb speaker read error: {:?}", err) 
+                }
+            }
+        }
+    };
+
+    let udp_async = async {
+
+        let mut udp_recv_buf = [0u8; TRANSFER_PACKET_SIZE];
+        loop {
+            let a = speaker_data_signal.wait();
+            let b = udp_socket.recv_from(&mut udp_recv_buf);
+            match select(a, b).await {
+                Either::First((data, good_samples)) => {
+                    udp_socket.send_to(&data[0..good_samples], remote_endpoint).await.unwrap()
+                }
+                Either::Second(x) => {
+                    match x {
+                        Ok((num_bytes, _meta)) => {
+                            mic_data_signal.signal((
+                                udp_recv_buf.clone(),
+                                num_bytes,
+                                Instant::now()
+                                ));
+                        }
+                        Err(x) => {
+                            defmt::error!("UDP recv error: {:?}", x);
+                        }
                     }
                 }
             }
         }
-    }
+    };
+
+    join3(mic_async, spkr_async, udp_async).await;
 }

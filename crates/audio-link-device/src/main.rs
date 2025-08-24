@@ -221,7 +221,7 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
 
 
     let remote_endpoint = UdpMetadata::from( IpEndpoint::new( addr_dongle, 1000 ));
-    const SAMPLES_PER_PACKET: u32 = 500;
+    const SAMPLES_PER_PACKET: u32 = 512;
     let sample_rate = 48000u64;
     let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
     let sample_interval_ns = (1000_000_000) / sample_rate;
