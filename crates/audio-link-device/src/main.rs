@@ -31,7 +31,10 @@ use embassy_futures::join::join3;
 use embassy_futures::select::{select, Either, Select};
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::udp::{PacketMetadata, RecvError, SendError, UdpMetadata, UdpSocket};
+use embassy_rp::clocks::ClockConfig;
+use embassy_rp::config::Config as RpConfig;
 use embassy_rp::{gpio, pwm, spi, peripherals, i2c, pio, uart, pac, usb, dma, bind_interrupts};
+use embassy_rp::pio::Pio;
 use embassy_rp::adc::Sample;
 use embassy_rp::gpio::{Output, Pin};
 use embassy_rp::peripherals::USB;
@@ -52,6 +55,10 @@ use micromath::F32;
 use uom::si::electric_charge::milliampere_hour;
 use uom::si::electric_charge::Units::coulomb;
 
+mod i2s_read;
+
+const SAMPLE_RATE: u32 = 48_000;
+
 type ProjectMutex = NoopRawMutex;
 
 bind_interrupts!(struct Irqs {
@@ -59,6 +66,7 @@ bind_interrupts!(struct Irqs {
     I2C0_IRQ => i2c::InterruptHandler<peripherals::I2C0>;
     I2C1_IRQ => i2c::InterruptHandler<peripherals::I2C1>;
     PIO0_IRQ_0 => pio::InterruptHandler<peripherals::PIO0>;
+    PIO1_IRQ_0 => pio::InterruptHandler<peripherals::PIO1>;
 });
 
 #[global_allocator]
@@ -106,7 +114,10 @@ fn main() -> ! {
         None => {}
     }*/
 
-    let p = embassy_rp::init(Default::default());
+    let clock_config = ClockConfig::system_freq(153600000).unwrap();
+    let config = RpConfig::new(clock_config);
+
+    let p = embassy_rp::init(config);
 
     let executor0 = EXECUTOR0.init(Executor::new());
     executor0.run(|spawner| unwrap!(spawner.spawn(core0_main(spawner, p))));
@@ -141,6 +152,24 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
         p.PIN_24,
         p.PIN_29,
         p.DMA_CH0,
+    );
+    
+        let i2s_sck = p.PIN_0;
+        let i2s_ws = p.PIN_1;
+        let i2s_data = p.PIN_2;
+    let Pio {
+        mut common, sm1, ..
+    } = Pio::new(p.PIO1, Irqs);
+    let i2s_program = i2s_read::PioI2sInProgram::new(&mut common);
+    let mut i2s = i2s_read::PioI2sIn::new_with_sample_rate(
+        &mut common,
+        sm1,
+        p.DMA_CH1,
+        i2s_sck,
+        i2s_ws,
+        i2s_data,
+        SAMPLE_RATE,
+        &i2s_program,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
@@ -223,15 +252,15 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
     let our_endpoint = IpListenEndpoint{ addr: Some(addr_device.clone()), port:1000 };
     udp_socket.bind(our_endpoint).unwrap();
 
-    const TRANSFER_PACKET_SIZE: usize = 1024;
-    const SAMPLE_LEN_BYTES: usize = 2;
+    const TRANSFER_PACKET_SIZE: usize = 768;
+    const SAMPLE_LEN_BYTES: usize = 3;
 
     let remote_endpoint = UdpMetadata::from( IpEndpoint::new( addr_dongle, 1000 ));
     let mic_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize)> = Signal::new();
     let speaker_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize, Instant)> = Signal::new();
 
     let udp_task = async {
-        let mut recv_buf = [0u8; 1024];
+        let mut recv_buf = [0u8; 768];
         loop {
             let a = mic_data_signal.wait();
             let b = udp_socket.recv_from(&mut recv_buf);
@@ -266,7 +295,7 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
     };
     
     let spkr_task = async{
-        const SAMPLES_PER_PACKET: u32 = 32;
+        const SAMPLES_PER_PACKET: u32 = 16;
         let mut latest_buffer = [0u8; TRANSFER_PACKET_SIZE];
         let sample_rate = 48000u64;
         let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
@@ -283,7 +312,7 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
                     let current_time = Instant::now();
                     last_packet_instant = current_time;
                     let offset = (((current_time - last_buffer_start).as_millis()*1000)/sample_interval_ns) as usize;
-                    let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
+                    let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*SAMPLE_LEN_BYTES];
                     for i in 0..SAMPLES_PER_PACKET as usize {
                         if (i + offset) < good_samples {
                             for j in 0..SAMPLE_LEN_BYTES {
@@ -304,26 +333,41 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
     };
     
     let mic_task = async{
-        const SAMPLES_PER_PACKET: u32 = 512;
-        let sample_rate = 48000u64;
-        let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
-        let sample_interval_ns = (1000_000_000) / sample_rate;
-        let mut last_packet_instant = None;
+        const SAMPLES_PER_PACKET: u32 = 256;
+        // let sample_rate = SAMPLE_RATE as u64;
+        // let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
+        // let sample_interval_ns = (1000_000_000) / sample_rate;
+        // let mut last_packet_instant = None;
+
+        let mut buf_a = [0u32; SAMPLES_PER_PACKET as usize];
+        let mut buf_b = [0u32; SAMPLES_PER_PACKET as usize];
+        let mut front_pointer = &mut buf_a;
+        let mut back_pointer = &mut buf_b;
+
+        let mut read_future = i2s.read(front_pointer);
         loop {
-            if let Some(last_packet_instant) = last_packet_instant {
-                Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns)).await;
-            }
-            let current_time = Instant::now();
-            last_packet_instant = Some(current_time);
-            let current_timestamp_ns = current_time.as_micros()*1000;
+            // if let Some(last_packet_instant) = last_packet_instant {
+            //     Timer::at(last_packet_instant + Duration::from_nanos(packet_interval_ns)).await;
+            // }
+            // let current_time = Instant::now();
+            // last_packet_instant = Some(current_time);
             let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*SAMPLE_LEN_BYTES];
-            for i in 0..SAMPLES_PER_PACKET as usize {
-                let current_timestamp_ns = current_timestamp_ns + (i as u64*sample_interval_ns);
-                let sample = if current_timestamp_ns%500_000 < 200_000 {20000u32} else {0u32};
-                for j in 0..SAMPLE_LEN_BYTES {
-                    samples_raw[i*SAMPLE_LEN_BYTES + j] = ((sample >> (8*j))&0xFF) as u8;
-                }
+            read_future.await;
+            let temp = front_pointer;
+            front_pointer = back_pointer;
+            back_pointer = temp;
+            read_future = i2s.read(front_pointer);
+            for (i, sample) in back_pointer.iter().enumerate() {
+                //let sample = i2s_read::extract_24bit(*sample);
+                //defmt::info!("{}", *sample);
+                samples_raw[SAMPLE_LEN_BYTES*i +2] = ((sample>>8) & 0xff) as u8;
+                samples_raw[SAMPLE_LEN_BYTES*i +1] = ((sample >> 16) & 0xff) as u8;
+                samples_raw[SAMPLE_LEN_BYTES*i +0] = ((sample >> 24) & 0xff) as u8;
+                // for j in 0..SAMPLE_LEN_BYTES {
+                //     samples_raw[i*SAMPLE_LEN_BYTES + j] = ((sample >> (8*j))&0xFF) as u8;
+                // }
             }
+            //defmt::info!("{:08X}", back_pointer[111]);
             mic_data_signal.signal((samples_raw, SAMPLES_PER_PACKET as usize));
         }
     };

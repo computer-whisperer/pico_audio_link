@@ -30,7 +30,7 @@ use static_cell::StaticCell;
 
 use embassy_net::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embassy_executor::{Executor, Spawner};
-use embassy_futures::join::join3;
+use embassy_futures::join::{join3, join};
 use embassy_futures::select::{select, select3, Either, Either3, Select};
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::udp::{PacketMetadata, RecvError, UdpMetadata, UdpSocket};
@@ -167,8 +167,8 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
         microphone::Microphone::new(
             &mut builder,
             state,
-            64,
-            SampleWidth::Width2Byte,
+            48,
+            SampleWidth::Width3Byte,
             &[48000],
             &[microphone::Channel::OnlyChannel],
         )
@@ -180,7 +180,7 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
         speaker::Speaker::new(
             &mut builder,
             state,
-            64,
+            48,
             SampleWidth::Width2Byte,
             &[48000],
             &[uac1::Channel::LeftFront],
@@ -274,14 +274,14 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
     let remote_endpoint = UdpMetadata::from( IpEndpoint::new( addr_device, 1000 ));
     udp_socket.bind(our_endpoint).unwrap();
 
-    const TRANSFER_PACKET_SIZE: usize = 1024;
-    const SAMPLE_LEN_BYTES: usize = 2;
+    const TRANSFER_PACKET_SIZE: usize = 768;
+    const SAMPLE_LEN_BYTES: usize = 3;
 
     let mic_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize, Instant)> = Signal::new();
     let speaker_data_signal: Signal<ProjectMutex, ([u8; TRANSFER_PACKET_SIZE], usize)> = Signal::new();
 
     let mic_async = async {
-        const SAMPLES_PER_PACKET: u32 = 32;
+        const SAMPLES_PER_PACKET: u32 = 16;
         let mut latest_buffer = [0u8; TRANSFER_PACKET_SIZE];
         let sample_rate = 48000u64;
         let packet_interval_ns = (1000_000_000*SAMPLES_PER_PACKET as u64) / sample_rate;
@@ -297,15 +297,30 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
                 Either::First(_) => {
                     let current_time = Instant::now();
                     last_packet_instant = current_time;
-                    let offset = (((current_time - last_buffer_start).as_millis()*1000)/sample_interval_ns) as usize;
-                    let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*2];
+                    let offset = (((current_time - last_buffer_start).as_micros()*1000)/sample_interval_ns) as usize;
+                    let mut samples_raw = [0u8; SAMPLES_PER_PACKET as usize*3];
                     for i in 0..SAMPLES_PER_PACKET as usize {
                         if (i + offset) < good_samples {
-                            for j in 0..SAMPLE_LEN_BYTES {
-                                samples_raw[i*SAMPLE_LEN_BYTES + j] =
+                            /*for j in 0..SAMPLE_LEN_BYTES {
+                                samples_raw[i*4 + j + 1] =
                                     latest_buffer[(i + offset)*SAMPLE_LEN_BYTES + j]
-                            }
+                            };*/
+
+                            let sample = ((latest_buffer[(i + offset)*SAMPLE_LEN_BYTES + 0] as u32) << 16) |
+                                         ((latest_buffer[(i + offset)*SAMPLE_LEN_BYTES + 1] as u32) << 8)  |
+                                         ((latest_buffer[(i + offset)*SAMPLE_LEN_BYTES + 2] as u32) << 0);
+                            let sample = sample | ((sample & 0x400000) <<1);
+                            //let sample = sample << 8;
+                            //defmt::info!("{:06X}", sample);
+                            
+                            //
+                            samples_raw[i*3 + 0] = ((sample >> 0)&0xFF) as u8;
+                            samples_raw[i*3 + 1] = ((sample >> 8)&0xFF) as u8;
+                            samples_raw[i*3 + 2] = ((sample >> 16)&0xFF) as u8;
+                            //samples_raw[i*4 + 3] = ((sample >> 24)&0xFF) as u8;
+                            //defmt::info!("{:02X}, {:02X}, {:02X}", latest_buffer[(i+offset)*3 + 0], latest_buffer[(i+offset)*3 + 1], latest_buffer[(i+offset)*3 + 2]);
                         }
+                        
                     }
                     usb_audio_stream.write_packet(&samples_raw).await.unwrap();
                 },
@@ -321,7 +336,7 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
     let spkr_async = async {
         let mut sample_buffer = [0u8; TRANSFER_PACKET_SIZE];
         let mut sample_buffer_idx = 0;
-        let mut data = [0u8; 64];
+        let mut data = [0u8; 48];
         loop {
             match speaker_stream.read_packet(&mut data).await {
                 Ok(a) => {
@@ -357,7 +372,7 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
                         Ok((num_bytes, _meta)) => {
                             mic_data_signal.signal((
                                 udp_recv_buf.clone(),
-                                num_bytes,
+                                num_bytes/3,
                                 Instant::now()
                                 ));
                         }
@@ -370,5 +385,5 @@ async fn core0_main(spawner: Spawner, p: embassy_rp::Peripherals) {
         }
     };
 
-    join3(mic_async, spkr_async, udp_async).await;
+    join(mic_async, udp_async).await;
 }
